@@ -1,18 +1,62 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Workverse Mail - standalone minimal email marketing stack
+
+Description: Standalone Workverse Mail - S3, CloudFront, Cognito, API Gateway, Lambda, SES and DynamoDB
 
 Parameters:
   SesFromEmail:
     Type: String
-    Description: Verified SES sender email address
-  OriginSecret:
-    Type: String
-    NoEcho: true
-    MinLength: 20
-    Description: Secret CloudFront sends to the API; keep private
+    Default: marketing@workverse.me
+    Description: Verified SES sender address
 
 Resources:
+
+  # ------------------------------------------------------------
+  # Cognito authentication
+  # ------------------------------------------------------------
+
+  MailUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: workverse-mail-users
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        UnusedAccountValidityDays: 7
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+
+  MailUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref MailUserPool
+      ClientName: workverse-mail-web
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ------------------------------------------------------------
+  # Dedicated DynamoDB table
+  # ------------------------------------------------------------
+
   MailTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -33,6 +77,10 @@ Resources:
       SSESpecification:
         SSEEnabled: true
 
+  # ------------------------------------------------------------
+  # Private S3 frontend bucket
+  # ------------------------------------------------------------
+
   MailBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -46,95 +94,9 @@ Resources:
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
 
-  MailFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      Runtime: python3.12
-      Handler: index.handler
-      InlineCode: |
-        import json, os, re, uuid
-        from datetime import datetime, timezone
-        import boto3
-        from botocore.exceptions import ClientError
-
-        ddb = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
-        ses = boto3.client('sesv2')
-        SECRET = os.environ['ORIGIN_SECRET']
-        FROM = os.environ['SES_FROM_EMAIL']
-        EMAIL_RE = re.compile(r'^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$')
-
-        def response(status, body):
-            return {'statusCode': status, 'headers': {'Content-Type':'application/json'}, 'body': json.dumps(body)}
-
-        def authorized(event):
-            headers = {str(k).lower(): str(v) for k,v in (event.get('headers') or {}).items()}
-            return headers.get('x-workverse-mail-origin') == SECRET
-
-        def handler(event, context):
-            if not authorized(event):
-                return response(403, {'message':'Forbidden'})
-            method = event.get('requestContext',{}).get('http',{}).get('method','GET')
-            path = event.get('rawPath','')
-            if method == 'POST' and path.endswith('/api/send'):
-                return send(event)
-            if method == 'GET' and re.search(r'/api/emails/[^/]+$', path):
-                return get_campaign(event)
-            if method == 'GET' and path.endswith('/api/emails'):
-                return list_campaigns()
-            return response(404, {'message':'Not found'})
-
-        def send(event):
-            try:
-                data = json.loads(event.get('body') or '{}')
-                recipients = list(dict.fromkeys([x.strip().lower() for x in data.get('recipients',[]) if isinstance(x,str) and EMAIL_RE.match(x.strip())]))
-                subject = str(data.get('subject','')).strip()
-                body = str(data.get('body',''))
-                if not recipients or len(recipients) > 100 or not subject or not body:
-                    return response(400, {'message':'Provide 1-100 valid recipients, a subject and body.'})
-                campaign_id = str(uuid.uuid4())
-                sent_at = datetime.now(timezone.utc).isoformat()
-                # Send separately so recipient addresses are never exposed to each other.
-                for email in recipients:
-                    ses.send_email(
-                        FromEmailAddress=FROM,
-                        Destination={'ToAddresses':[email]},
-                        Content={'Simple': {'Subject': {'Data':subject, 'Charset':'UTF-8'}, 'Body': {'Text': {'Data':body, 'Charset':'UTF-8'}}}}
-                    )
-                    ddb.put_item(Item={'pk':'CAMPAIGN#'+campaign_id,'sk':'RECIPIENT#'+email,'email':email,'subject':subject,'body':body,'sentAt':sent_at})
-                ddb.put_item(Item={'pk':'CAMPAIGN#'+campaign_id,'sk':'META','campaignId':campaign_id,'subject':subject,'body':body,'recipientCount':len(recipients),'recipients':recipients,'sentAt':sent_at})
-                return response(200, {'campaignId':campaign_id,'recipientCount':len(recipients)})
-            except ClientError as e:
-                msg = e.response.get('Error',{}).get('Message','SES error')
-                return response(502, {'message':msg})
-            except Exception as e:
-                return response(500, {'message':str(e)})
-
-        def list_campaigns():
-            # Simple scan is fine for this small MVP. Add a GSI later if history grows significantly.
-            out = ddb.scan(FilterExpression='sk = :meta', ExpressionAttributeValues={':meta':'META'}, Limit=50)
-            items = sorted(out.get('Items',[]), key=lambda x:x.get('sentAt',''), reverse=True)
-            return response(200, {'items':items[:20]})
-
-        def get_campaign(event):
-            cid = event.get('rawPath','').rstrip('/').split('/')[-1]
-            out = ddb.get_item(Key={'pk':'CAMPAIGN#'+cid,'sk':'META'})
-            item = out.get('Item')
-            if not item: return response(404, {'message':'Campaign not found'})
-            return response(200, item)
-      Environment:
-        Variables:
-          TABLE_NAME: !Ref MailTable
-          SES_FROM_EMAIL: !Ref SesFromEmail
-          ORIGIN_SECRET: !Ref OriginSecret
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref MailTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - ses:SendEmail
-                - ses:SendRawEmail
-              Resource: '*'
+  # ------------------------------------------------------------
+  # HTTP API with Cognito JWT authorizer
+  # ------------------------------------------------------------
 
   MailApi:
     Type: AWS::Serverless::HttpApi
@@ -144,47 +106,310 @@ Resources:
         AllowOrigins:
           - '*'
         AllowHeaders:
-          - content-type
+          - Authorization
+          - Content-Type
         AllowMethods:
           - GET
           - POST
+          - OPTIONS
+      Auth:
+        DefaultAuthorizer: CognitoJwtAuthorizer
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource:
+              - $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${MailUserPool}
+              audience:
+                - !Ref MailUserPoolClient
 
-  SendRoute:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref MailApi
-      RouteKey: 'POST /api/send'
-      Target: !Sub integrations/${MailIntegration}
+  # ------------------------------------------------------------
+  # Lambda
+  # ------------------------------------------------------------
 
-  ListRoute:
-    Type: AWS::ApiGatewayV2::Route
+  MailFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      ApiId: !Ref MailApi
-      RouteKey: 'GET /api/emails'
-      Target: !Sub integrations/${MailIntegration}
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
 
-  DetailRoute:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref MailApi
-      RouteKey: 'GET /api/emails/{campaignId}'
-      Target: !Sub integrations/${MailIntegration}
+      InlineCode: |
+        import base64
+        import json
+        import os
+        import re
+        import uuid
+        from datetime import datetime, timezone
 
-  MailIntegration:
-    Type: AWS::ApiGatewayV2::Integration
-    Properties:
-      ApiId: !Ref MailApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt MailFunction.Arn
-      PayloadFormatVersion: '2.0'
+        import boto3
+        from botocore.exceptions import ClientError
 
-  MailFunctionApiPermission:
-    Type: AWS::Lambda::Permission
+        table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+        ses = boto3.client("sesv2")
+        FROM = os.environ["SES_FROM_EMAIL"]
+
+        EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+        def response(status, body):
+            return {
+                "statusCode": status,
+                "headers": {
+                    "Content-Type": "application/json"
+                },
+                "body": json.dumps(body)
+            }
+
+        def parse_body(event):
+            body = event.get("body") or "{}"
+            if event.get("isBase64Encoded"):
+                body = base64.b64decode(body).decode("utf-8")
+            return json.loads(body)
+
+        def handler(event, context):
+            method = (
+                event.get("requestContext", {})
+                .get("http", {})
+                .get("method", "")
+            )
+            path = event.get("rawPath", "")
+
+            if method == "POST" and path.endswith("/api/send"):
+                return send_email(event)
+
+            if method == "GET" and path.endswith("/api/emails"):
+                return list_campaigns()
+
+            match = re.search(r"/api/emails/([^/]+)$", path)
+            if method == "GET" and match:
+                return get_campaign(match.group(1))
+
+            return response(404, {"message": "Not found"})
+
+        def send_email(event):
+            try:
+                data = parse_body(event)
+
+                raw_recipients = data.get("recipients", [])
+                if not isinstance(raw_recipients, list):
+                    return response(400, {"message": "Recipients must be a list."})
+
+                recipients = []
+                invalid = []
+
+                for value in raw_recipients:
+                    if not isinstance(value, str):
+                        continue
+                    email = value.strip().lower()
+                    if EMAIL_RE.fullmatch(email):
+                        recipients.append(email)
+                    elif email:
+                        invalid.append(email)
+
+                recipients = list(dict.fromkeys(recipients))
+
+                subject = str(data.get("subject", "")).strip()
+                body = str(data.get("body", ""))
+
+                if not recipients:
+                    return response(400, {"message": "At least one valid recipient is required."})
+
+                if len(recipients) > 100:
+                    return response(400, {"message": "A maximum of 100 recipients is allowed per send."})
+
+                if not subject:
+                    return response(400, {"message": "Subject is required."})
+
+                if not body.strip():
+                    return response(400, {"message": "Email body is required."})
+
+                campaign_id = str(uuid.uuid4())
+                sent_at = datetime.now(timezone.utc).isoformat()
+                successful = 0
+                failed = []
+
+                for email in recipients:
+                    try:
+                        result = ses.send_email(
+                            FromEmailAddress=FROM,
+                            Destination={"ToAddresses": [email]},
+                            Content={
+                                "Simple": {
+                                    "Subject": {
+                                        "Data": subject,
+                                        "Charset": "UTF-8"
+                                    },
+                                    "Body": {
+                                        "Text": {
+                                            "Data": body,
+                                            "Charset": "UTF-8"
+                                        }
+                                    }
+                                }
+                            }
+                        )
+
+                        table.put_item(
+                            Item={
+                                "pk": "CAMPAIGN#" + campaign_id,
+                                "sk": "RECIPIENT#" + email,
+                                "campaignId": campaign_id,
+                                "email": email,
+                                "subject": subject,
+                                "sentAt": sent_at,
+                                "status": "SENT",
+                                "messageId": result.get("MessageId", "")
+                            }
+                        )
+                        successful += 1
+
+                    except ClientError as error:
+                        failed.append({
+                            "email": email,
+                            "message": error.response.get("Error", {}).get(
+                                "Message", "SES error"
+                            )
+                        })
+
+                status = "SENT" if not failed else (
+                    "FAILED" if successful == 0 else "PARTIAL"
+                )
+
+                campaign_item = {
+                    "campaignId": campaign_id,
+                    "subject": subject,
+                    "body": body,
+                    "recipientCount": len(recipients),
+                    "successful": successful,
+                    "failed": len(failed),
+                    "invalid": len(invalid),
+                    "sentAt": sent_at,
+                    "status": status
+                }
+
+                table.put_item(
+                    Item={
+                        "pk": "CAMPAIGNS",
+                        "sk": sent_at + "#" + campaign_id,
+                        **campaign_item
+                    }
+                )
+
+                table.put_item(
+                    Item={
+                        "pk": "CAMPAIGN#" + campaign_id,
+                        "sk": "META",
+                        **campaign_item
+                    }
+                )
+
+                return response(200, {
+                    "campaignId": campaign_id,
+                    "recipientCount": len(recipients),
+                    "successful": successful,
+                    "failed": failed,
+                    "invalid": invalid,
+                    "status": status
+                })
+
+            except Exception as error:
+                return response(500, {"message": str(error)})
+
+        def list_campaigns():
+            result = table.query(
+                KeyConditionExpression="pk = :pk",
+                ExpressionAttributeValues={":pk": "CAMPAIGNS"},
+                ScanIndexForward=False,
+                Limit=20
+            )
+            return response(200, {"items": result.get("Items", [])})
+
+        def get_campaign(campaign_id):
+            meta = table.get_item(
+                Key={
+                    "pk": "CAMPAIGN#" + campaign_id,
+                    "sk": "META"
+                }
+            )
+
+            if "Item" not in meta:
+                return response(404, {"message": "Campaign not found"})
+
+            campaign = meta["Item"]
+
+            recipients = table.query(
+                KeyConditionExpression="pk = :pk",
+                ExpressionAttributeValues={
+                    ":pk": "CAMPAIGN#" + campaign_id
+                }
+            )
+
+            return response(200, {
+                "campaign": campaign,
+                "recipients": recipients.get("Items", [])
+            })
+
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref MailTable
+          SES_FROM_EMAIL: !Ref SesFromEmail
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MailTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+
+      Events:
+        SendEmail:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MailApi
+            Path: /api/send
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwtAuthorizer
+
+        ListEmails:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MailApi
+            Path: /api/emails
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwtAuthorizer
+
+        GetEmail:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MailApi
+            Path: /api/emails/{campaignId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwtAuthorizer
+
+  # ------------------------------------------------------------
+  # CloudFront OAC
+  # ------------------------------------------------------------
+
+  MailOAC:
+    Type: AWS::CloudFront::OriginAccessControl
     Properties:
-      FunctionName: !Ref MailFunction
-      Action: lambda:InvokeFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MailApi}/*
+      OriginAccessControlConfig:
+        Name: workverse-mail-oac
+        Description: CloudFront access to private Workverse Mail S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ------------------------------------------------------------
+  # CloudFront distribution
+  # ------------------------------------------------------------
 
   MailDistribution:
     Type: AWS::CloudFront::Distribution
@@ -193,88 +418,118 @@ Resources:
         Enabled: true
         DefaultRootObject: index.html
         PriceClass: PriceClass_100
+
         Origins:
           - Id: S3Origin
             DomainName: !GetAtt MailBucket.RegionalDomainName
             S3OriginConfig: {}
             OriginAccessControlId: !Ref MailOAC
+
           - Id: ApiOrigin
-            DomainName: !Select [2, !Split ['/', !GetAtt MailApi.ApiEndpoint]]
+            DomainName: !Select
+              - 2
+              - !Split
+                - /
+                - !GetAtt MailApi.ApiEndpoint
             OriginPath: /prod
-            CustomHeaders:
-              - HeaderName: X-Workverse-Mail-Origin
-                HeaderValue: !Ref OriginSecret
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
+
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
           Compress: true
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
         CacheBehaviors:
           - PathPattern: /api/*
             TargetOriginId: ApiOrigin
             ViewerProtocolPolicy: redirect-to-https
-            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
-            CachedMethods: [GET, HEAD, OPTIONS]
-            CachePolicyId: !Ref ApiCacheDisabledPolicy
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - POST
+              - PUT
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
             OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
         ViewerCertificate:
           CloudFrontDefaultCertificate: true
 
-
-  ApiCacheDisabledPolicy:
-    Type: AWS::CloudFront::CachePolicy
-    Properties:
-      CachePolicyConfig:
-        Name: workverse-mail-api-no-cache
-        DefaultTTL: 0
-        MinTTL: 0
-        MaxTTL: 0
-        ParametersInCacheKeyAndForwardedToOrigin:
-          CookiesConfig:
-            CookieBehavior: none
-          HeadersConfig:
-            HeaderBehavior: none
-          QueryStringsConfig:
-            QueryStringBehavior: all
-          EnableAcceptEncodingGzip: true
-          EnableAcceptEncodingBrotli: true
-
-  MailOAC:
-    Type: AWS::CloudFront::OriginAccessControl
-    Properties:
-      OriginAccessControlConfig:
-        Name: workverse-mail-oac
-        OriginAccessControlOriginType: s3
-        SigningBehavior: always
-        SigningProtocol: sigv4
+  # ------------------------------------------------------------
+  # S3 bucket policy for CloudFront OAC
+  # ------------------------------------------------------------
 
   MailBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref MailBucket
       PolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Sid: AllowCloudFrontRead
             Effect: Allow
             Principal:
               Service: cloudfront.amazonaws.com
             Action: s3:GetObject
-            Resource: !Sub '${MailBucket.Arn}/*'
+            Resource: !Sub "${MailBucket.Arn}/*"
             Condition:
               StringEquals:
-                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${MailDistribution}
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${MailDistribution}"
 
 Outputs:
   FrontendBucket:
+    Description: Private S3 bucket for frontend
     Value: !Ref MailBucket
+
   CloudFrontUrl:
-    Value: !Sub https://${MailDistribution.DomainName}
+    Description: HTTPS URL
+    Value: !Sub "https://${MailDistribution.DomainName}"
+
   CloudFrontDistributionId:
+    Description: CloudFront distribution ID
     Value: !Ref MailDistribution
+
   ApiEndpoint:
+    Description: API Gateway endpoint
     Value: !GetAtt MailApi.ApiEndpoint
+
   DynamoTable:
+    Description: Dedicated DynamoDB table
     Value: !Ref MailTable
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref MailUserPool
+
+  UserPoolClientId:
+    Description: Cognito browser App Client ID
+    Value: !Ref MailUserPoolClient
+
+  CognitoIssuer:
+    Description: Cognito JWT issuer
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${MailUserPool}"

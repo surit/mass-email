@@ -1,7 +1,110 @@
-<!doctype html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Workverse Mail</title><link rel="stylesheet" href="style.css"></head><body>
-<header><div class="brand"><div class="logo">✉</div><div><b>Workverse Mail</b><span>Email Marketing</span></div></div><div class="user">SA</div></header>
-<div class="layout"><aside><button class="nav active">✎ <span>Compose</span></button><button class="nav" id="sentNav">↗ <span>Sent Emails</span></button><div class="about">ⓘ <span>About</span></div></aside>
-<main><section class="card compose"><h1>Send Email</h1><label>To</label><textarea id="recipients" placeholder="Enter email addresses separated by comma"></textarea><div class="recipient-actions"><button id="addEmail">＋ Add Email</button><span>or</span><label class="upload">↥ Upload CSV<input id="csv" type="file" accept=".csv,text/csv"></label></div><small>CSV format: one email per line</small><label>Subject</label><input id="subject" placeholder="Enter subject"><label>Body</label><textarea class="body" id="body" placeholder="Write your email here..."></textarea><div class="actions"><button class="preview" id="preview">◉ Send Preview</button><button class="send" id="send">➤ Send Email</button></div><p id="status"></p></section>
-<section class="card history"><div class="history-head"><h2>Last Sent Emails</h2><button id="viewAll">View all →</button></div><div id="sentList"></div></section></main></div>
-<div class="modal" id="modal"><div class="modal-box"><button class="close" id="close">×</button><h2>Email Preview</h2><div class="preview-meta"><b id="pSubject"></b><span id="pTo"></span></div><div id="pBody" class="preview-body"></div><button class="send" id="confirmSend">Send Email</button></div></div>
-<div class="modal" id="detailModal"><div class="modal-box"><button class="close" id="detailClose">×</button><h2 id="detailSubject"></h2><div class="preview-meta"><span id="detailDate"></span><span id="detailRecipients"></span></div><div id="detailBody" class="preview-body"></div></div></div><script src="app.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workverse Mail</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="container">
+    <section id="loginView" class="card auth-card">
+      <div class="brand">Workverse Mail</div>
+      <h1>Sign in</h1>
+      <p class="muted">Authorized users only.</p>
+
+      <form id="loginForm">
+        <label>Email</label>
+        <input id="loginEmail" type="email" autocomplete="username" required>
+
+        <label>Password</label>
+        <input id="loginPassword" type="password" autocomplete="current-password" required>
+
+        <button type="submit">Sign in</button>
+      </form>
+
+      <form id="newPasswordForm" class="hidden">
+        <p class="notice">This is your first sign-in. Set a new password.</p>
+
+        <label>New password</label>
+        <input id="newPassword" type="password" autocomplete="new-password" minlength="12" required>
+
+        <button type="submit">Set password & sign in</button>
+      </form>
+
+      <p id="loginMessage" class="message"></p>
+    </section>
+
+    <section id="appView" class="hidden">
+      <header class="topbar">
+        <div>
+          <div class="brand">Workverse Mail</div>
+          <div class="muted">Simple email marketing</div>
+        </div>
+        <button id="signOutBtn" class="secondary">Sign out</button>
+      </header>
+
+      <div class="grid">
+        <section class="card">
+          <div class="section-title">
+            <h2>Send email</h2>
+            <span id="recipientCount" class="pill">0 recipients</span>
+          </div>
+
+          <label>To</label>
+          <textarea id="recipients" rows="4" placeholder="email@example.com, another@example.com"></textarea>
+
+          <div class="row">
+            <label class="file-button">
+              Upload CSV
+              <input id="csvFile" type="file" accept=".csv,text/csv">
+            </label>
+            <button id="clearRecipientsBtn" type="button" class="secondary">Clear</button>
+          </div>
+          <p class="hint">Maximum 100 recipients per send. CSV can contain one or more email addresses.</p>
+
+          <label>Subject</label>
+          <input id="subject" type="text" maxlength="998" placeholder="Email subject">
+
+          <label>Body</label>
+          <textarea id="body" rows="12" placeholder="Write your email..."></textarea>
+
+          <div class="actions">
+            <button id="previewBtn" type="button" class="secondary">Send preview</button>
+            <button id="sendBtn" type="button">Send email</button>
+          </div>
+
+          <p id="appMessage" class="message"></p>
+        </section>
+
+        <section class="card">
+          <div class="section-title">
+            <h2>Last sent emails</h2>
+            <button id="refreshBtn" type="button" class="secondary small">Refresh</button>
+          </div>
+          <div id="history" class="history">
+            <div class="muted">Loading...</div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div id="previewModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="section-title">
+        <h2>Preview</h2>
+        <button id="closePreviewBtn" type="button" class="secondary small">Close</button>
+      </div>
+      <div class="preview-meta">
+        <strong>To:</strong> <span id="previewTo"></span><br>
+        <strong>Subject:</strong> <span id="previewSubject"></span>
+      </div>
+      <pre id="previewBody" class="preview-body"></pre>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
