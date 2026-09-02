@@ -2,108 +2,106 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Workverse Mail</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main class="container">
-    <section id="loginView" class="card auth-card">
-      <div class="brand">Workverse Mail</div>
-      <h1>Sign in</h1>
-      <p class="muted">Authorized users only.</p>
-
+  <div id="loginView" class="center">
+    <div class="card login-card">
+      <h1>Workverse Mail</h1>
+      <p class="muted">Sign in to send email campaigns.</p>
       <form id="loginForm">
         <label>Email</label>
         <input id="loginEmail" type="email" autocomplete="username" required>
-
         <label>Password</label>
         <input id="loginPassword" type="password" autocomplete="current-password" required>
-
         <button type="submit">Sign in</button>
+        <p id="loginError" class="error"></p>
       </form>
-
-      <form id="newPasswordForm" class="hidden">
-        <p class="notice">This is your first sign-in. Set a new password.</p>
-
+      <form id="newPasswordForm" hidden>
+        <p>Your administrator gave you a temporary password. Set a new password to continue.</p>
         <label>New password</label>
-        <input id="newPassword" type="password" autocomplete="new-password" minlength="12" required>
-
-        <button type="submit">Set password & sign in</button>
+        <input id="newPassword" type="password" minlength="12" required>
+        <button type="submit">Set password</button>
+        <p id="newPasswordError" class="error"></p>
       </form>
-
-      <p id="loginMessage" class="message"></p>
-    </section>
-
-    <section id="appView" class="hidden">
-      <header class="topbar">
-        <div>
-          <div class="brand">Workverse Mail</div>
-          <div class="muted">Simple email marketing</div>
-        </div>
-        <button id="signOutBtn" class="secondary">Sign out</button>
-      </header>
-
-      <div class="grid">
-        <section class="card">
-          <div class="section-title">
-            <h2>Send email</h2>
-            <span id="recipientCount" class="pill">0 recipients</span>
-          </div>
-
-          <label>To</label>
-          <textarea id="recipients" rows="4" placeholder="email@example.com, another@example.com"></textarea>
-
-          <div class="row">
-            <label class="file-button">
-              Upload CSV
-              <input id="csvFile" type="file" accept=".csv,text/csv">
-            </label>
-            <button id="clearRecipientsBtn" type="button" class="secondary">Clear</button>
-          </div>
-          <p class="hint">Maximum 100 recipients per send. CSV can contain one or more email addresses.</p>
-
-          <label>Subject</label>
-          <input id="subject" type="text" maxlength="998" placeholder="Email subject">
-
-          <label>Body</label>
-          <textarea id="body" rows="12" placeholder="Write your email..."></textarea>
-
-          <div class="actions">
-            <button id="previewBtn" type="button" class="secondary">Send preview</button>
-            <button id="sendBtn" type="button">Send email</button>
-          </div>
-
-          <p id="appMessage" class="message"></p>
-        </section>
-
-        <section class="card">
-          <div class="section-title">
-            <h2>Last sent emails</h2>
-            <button id="refreshBtn" type="button" class="secondary small">Refresh</button>
-          </div>
-          <div id="history" class="history">
-            <div class="muted">Loading...</div>
-          </div>
-        </section>
-      </div>
-    </section>
-  </main>
-
-  <div id="previewModal" class="modal hidden">
-    <div class="modal-card">
-      <div class="section-title">
-        <h2>Preview</h2>
-        <button id="closePreviewBtn" type="button" class="secondary small">Close</button>
-      </div>
-      <div class="preview-meta">
-        <strong>To:</strong> <span id="previewTo"></span><br>
-        <strong>Subject:</strong> <span id="previewSubject"></span>
-      </div>
-      <pre id="previewBody" class="preview-body"></pre>
     </div>
   </div>
 
+  <div id="appView" hidden>
+    <header>
+      <div>
+        <strong>Workverse Mail</strong>
+        <span class="muted">Email marketing</span>
+      </div>
+      <div class="userbar"><span id="userEmail"></span><button id="signOut" class="secondary">Sign out</button></div>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>Send Email</h2>
+
+        <label>To</label>
+        <textarea id="recipients" rows="3" placeholder="person@example.com, another@example.com"></textarea>
+        <div class="row between">
+          <small class="muted">Separate emails with commas, spaces or new lines. Maximum 100 recipients.</small>
+          <label class="upload">
+            Upload CSV
+            <input id="csvFile" type="file" accept=".csv,text/csv">
+          </label>
+        </div>
+        <div id="recipientCount" class="muted">0 recipients</div>
+
+        <label>Subject</label>
+        <input id="subject" type="text" maxlength="200" placeholder="Email subject">
+
+        <label>Body</label>
+        <div class="editor-toolbar">
+          <button type="button" data-cmd="bold" title="Bold"><b>B</b></button>
+          <button type="button" data-cmd="italic" title="Italic"><i>I</i></button>
+          <button type="button" data-cmd="underline" title="Underline"><u>U</u></button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="insertUnorderedList" title="Bullet list">&#8226; List</button>
+          <button type="button" data-cmd="insertOrderedList" title="Numbered list">1. List</button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="formatBlock" data-val="H1" title="Heading 1">H1</button>
+          <button type="button" data-cmd="formatBlock" data-val="H2" title="Heading 2">H2</button>
+          <button type="button" data-cmd="formatBlock" data-val="BLOCKQUOTE" title="Quote">“Quote”</button>
+          <span class="sep"></span>
+          <button type="button" data-cmd="createLink" title="Link">Link</button>
+          <button type="button" id="imageBtn" title="Insert image">Image</button>
+          <button type="button" data-cmd="removeFormat" title="Clear formatting">Clear</button>
+        </div>
+        <input id="imageUpload" type="file" accept="image/*" hidden>
+        <div id="body" contenteditable="true" class="editor-body" placeholder="Write your email..."></div>
+
+        <div class="actions">
+          <button id="previewBtn" class="secondary">Send Preview</button>
+          <button id="sendBtn">Send Email</button>
+        </div>
+        <p id="status" class="status"></p>
+      </section>
+
+      <section class="card">
+        <div class="row between">
+          <h2>Last Sent Emails</h2>
+          <button id="refreshBtn" class="secondary small">Refresh</button>
+        </div>
+        <div id="history"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="previewModal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="row between"><h2>Preview</h2><button id="closePreview" class="secondary small">Close</button></div>
+      <div class="preview-meta"><b>Subject:</b> <span id="previewSubject"></span></div>
+      <div id="previewBody" class="preview-content"></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.12/dist/amazon-cognito-identity.min.js"></script>
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>

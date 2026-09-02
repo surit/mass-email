@@ -1,419 +1,360 @@
+(() => {
+  const cfg = window.WORKVERSE_MAIL_CONFIG || {};
+  const API = "/api";
+  let user = null;
+  let cognitoUser = null;
 
-const cfg = window.WORKVERSE_MAIL_CONFIG || {};
-
-const loginView = document.getElementById("loginView");
-const appView = document.getElementById("appView");
-const loginForm = document.getElementById("loginForm");
-const newPasswordForm = document.getElementById("newPasswordForm");
-const loginMessage = document.getElementById("loginMessage");
-const appMessage = document.getElementById("appMessage");
-
-let authSession = null;
-let pendingChallenge = null;
-
-function setMessage(element, text, ok = false) {
-  element.textContent = text || "";
-  element.style.color = ok ? "#26734d" : "#a23a3a";
-}
-
-function tokenKey() {
-  return `workverse_mail_${cfg.userPoolId}_tokens`;
-}
-
-function saveTokens(result) {
-  localStorage.setItem(tokenKey(), JSON.stringify(result));
-}
-
-function loadTokens() {
-  try {
-    return JSON.parse(localStorage.getItem(tokenKey()) || "null");
-  } catch {
-    return null;
-  }
-}
-
-function clearTokens() {
-  localStorage.removeItem(tokenKey());
-}
-
-async function cognito(target, payload) {
-  const response = await fetch(
-    `https://cognito-idp.${cfg.region}.amazonaws.com/`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-amz-json-1.1",
-        "X-Amz-Target": `AWSCognitoIdentityProviderService.${target}`
-      },
-      body: JSON.stringify(payload)
-    }
-  );
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(data.message || data.__type || "Authentication failed");
-  }
-
-  return data;
-}
-
-async function signIn(email, password) {
-  return cognito("InitiateAuth", {
-    AuthFlow: "USER_PASSWORD_AUTH",
-    ClientId: cfg.clientId,
-    AuthParameters: {
-      USERNAME: email,
-      PASSWORD: password
-    }
-  });
-}
-
-async function completeNewPassword(email, newPassword, session) {
-  return cognito("RespondToAuthChallenge", {
-    ChallengeName: "NEW_PASSWORD_REQUIRED",
-    ClientId: cfg.clientId,
-    Session: session,
-    ChallengeResponses: {
-      USERNAME: email,
-      NEW_PASSWORD: newPassword
-    }
-  });
-}
-
-function showApp() {
-  loginView.classList.add("hidden");
-  appView.classList.remove("hidden");
-  loadHistory();
-}
-
-function showLogin() {
-  appView.classList.add("hidden");
-  loginView.classList.remove("hidden");
-}
-
-function authenticated() {
-  return !!(authSession && authSession.AccessToken);
-}
-
-function getAccessToken() {
-  return authSession?.AccessToken || "";
-}
-
-async function api(path, options = {}) {
-  if (!authenticated()) {
-    throw new Error("Please sign in.");
-  }
-
-  const headers = {
-    Authorization: `Bearer ${getAccessToken()}`,
-    ...(options.headers || {})
-  };
-
-  const response = await fetch(path, {
-    ...options,
-    headers
+  const $ = id => document.getElementById(id);
+  const pool = () => new AmazonCognitoIdentity.CognitoUserPool({
+    UserPoolId: cfg.userPoolId,
+    ClientId: cfg.clientId
   });
 
-  let data = {};
-  try {
-    data = await response.json();
-  } catch {}
+  function showApp() {
+    $("loginView").hidden = true;
+    $("appView").hidden = false;
+    $("userEmail").textContent = user?.getUsername?.() || "";
+    loadHistory();
+  }
 
-  if (response.status === 401 || response.status === 403) {
-    clearTokens();
-    authSession = null;
+  function showLogin() {
+    $("loginView").hidden = false;
+    $("appView").hidden = true;
+  }
+
+  function getSession() {
+    try {
+      const p = pool();
+      cognitoUser = p.getCurrentUser();
+      if (!cognitoUser) return;
+      cognitoUser.getSession((err, session) => {
+        if (!err && session.isValid()) {
+          user = cognitoUser;
+          showApp();
+        }
+      });
+    } catch (_) {}
+  }
+
+  $("loginForm").addEventListener("submit", e => {
+    e.preventDefault();
+    $("loginError").textContent = "";
+    if (!cfg.userPoolId || cfg.userPoolId.startsWith("REPLACE")) {
+      $("loginError").textContent = "Cognito configuration is missing.";
+      return;
+    }
+    const email = $("loginEmail").value.trim();
+    const password = $("loginPassword").value;
+    const authenticationData = { Username: email, Password: password };
+    const authenticationDetails = new AmazonCognitoIdentity.AuthenticationDetails(authenticationData);
+    cognitoUser = new AmazonCognitoIdentity.CognitoUser({ Username: email, Pool: pool() });
+    cognitoUser.authenticateUser(authenticationDetails, {
+      onSuccess: result => { user = cognitoUser; showApp(); },
+      onFailure: err => { $("loginError").textContent = err.message || "Sign in failed."; },
+      newPasswordRequired: () => {
+        $("loginForm").hidden = true;
+        $("newPasswordForm").hidden = false;
+      }
+    });
+  });
+
+  $("newPasswordForm").addEventListener("submit", e => {
+    e.preventDefault();
+    $("newPasswordError").textContent = "";
+    cognitoUser.completeNewPasswordChallenge($("newPassword").value, {}, {
+      onSuccess: () => { user = cognitoUser; showApp(); },
+      onFailure: err => { $("newPasswordError").textContent = err.message || "Could not set password."; }
+    });
+  });
+
+  $("signOut").addEventListener("click", () => {
+    if (cognitoUser) cognitoUser.signOut();
+    user = null;
+    cognitoUser = null;
+    $("loginForm").reset();
+    $("newPasswordForm").hidden = true;
+    $("loginForm").hidden = false;
     showLogin();
-    throw new Error("Your session has expired. Please sign in again.");
+  });
+
+  function recipients() {
+    return [...new Set($("recipients").value.split(/[\s,;]+/).map(x => x.trim().toLowerCase()).filter(Boolean))];
   }
 
-  if (!response.ok) {
-    throw new Error(data.message || "Request failed");
+  function updateCount() {
+    $("recipientCount").textContent = `${recipients().length} recipient${recipients().length === 1 ? "" : "s"}`;
   }
 
-  return data;
-}
+  $("recipients").addEventListener("input", updateCount);
 
-loginForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setMessage(loginMessage, "Signing in...", true);
+  $("csvFile").addEventListener("change", async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const text = await file.text();
+    const found = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig) || [];
+    $("recipients").value = [...new Set([...recipients(), ...found.map(x => x.toLowerCase())])].join("\n");
+    updateCount();
+  });
 
-  const email = document.getElementById("loginEmail").value.trim();
-  const password = document.getElementById("loginPassword").value;
+  // Rich-text toolbar
+  document.querySelectorAll(".editor-toolbar button[data-cmd]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const cmd = btn.dataset.cmd;
+      const val = btn.dataset.val || null;
+      if (cmd === "createLink") {
+        const url = prompt("Enter URL:");
+        if (url) document.execCommand(cmd, false, url);
+      } else {
+        document.execCommand(cmd, false, val);
+      }
+      $("body").focus();
+    });
+  });
 
-  try {
-    const result = await signIn(email, password);
+  // Image compression
+  async function compressImage(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = async () => {
+        URL.revokeObjectURL(url);
+        let width = img.width;
+        let height = img.height;
 
-    if (result.ChallengeName === "NEW_PASSWORD_REQUIRED") {
-      pendingChallenge = { email, session: result.Session };
-      loginForm.classList.add("hidden");
-      newPasswordForm.classList.remove("hidden");
-      setMessage(loginMessage, "Set your new password.", true);
+        const maxDim = file.size > 6 * 1024 * 1024 ? 1200 : 1600;
+        let quality = file.size > 6 * 1024 * 1024 ? 0.7 : 0.85;
+
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round(height * maxDim / width);
+            width = maxDim;
+          } else {
+            width = Math.round(width * maxDim / height);
+            height = maxDim;
+          }
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(img, 0, 0, width, height);
+
+        const toBlob = (q) => new Promise(res => canvas.toBlob(res, "image/jpeg", q));
+
+        let blob = await toBlob(quality);
+        if (blob.size > 6 * 1024 * 1024) blob = await toBlob(0.6);
+        if (blob.size > 6 * 1024 * 1024) blob = await toBlob(0.5);
+        if (blob.size > 6 * 1024 * 1024) {
+          const scale = 0.7;
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+          canvas.width = width;
+          canvas.height = height;
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          blob = await toBlob(0.5);
+        }
+        resolve(blob);
+      };
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = url;
+    });
+  }
+
+  function readBlobAsDataURL(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function insertImage(src) {
+    const img = document.createElement("img");
+    img.src = src;
+    img.style.maxWidth = "100%";
+    const sel = window.getSelection();
+    if (sel.rangeCount > 0) {
+      const range = sel.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(img);
+      range.setStartAfter(img);
+      range.setEndAfter(img);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } else {
+      $("body").appendChild(img);
+    }
+    $("body").focus();
+  }
+
+  // Image button
+  $("imageBtn").addEventListener("click", () => $("imageUpload").click());
+
+  $("imageUpload").addEventListener("change", async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const blob = await compressImage(file);
+      const dataUrl = await readBlobAsDataURL(blob);
+      insertImage(dataUrl);
+    } catch (err) {
+      alert("Could not process image: " + err.message);
+    }
+    e.target.value = "";
+  });
+
+  // Paste handler
+  $("body").addEventListener("paste", async e => {
+    const items = e.clipboardData?.items;
+    if (items) {
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          e.preventDefault();
+          try {
+            const blob = await compressImage(item.getAsFile());
+            const dataUrl = await readBlobAsDataURL(blob);
+            insertImage(dataUrl);
+          } catch (err) {
+            alert("Could not paste image: " + err.message);
+          }
+          return;
+        }
+      }
+    }
+    e.preventDefault();
+    const text = (e.clipboardData || window.clipboardData).getData("text/plain");
+    document.execCommand("insertText", false, text);
+  });
+
+  // Preview
+  $("previewBtn").addEventListener("click", () => {
+    $("previewSubject").textContent = $("subject").value || "(No subject)";
+    $("previewBody").innerHTML = $("body").innerHTML || "<p>(Empty body)</p>";
+    $("previewModal").hidden = false;
+  });
+  $("closePreview").addEventListener("click", () => $("previewModal").hidden = true);
+  $("previewModal").addEventListener("click", e => { if (e.target === $("previewModal")) $("previewModal").hidden = true; });
+
+  async function api(path, options = {}) {
+    return new Promise((resolve, reject) => {
+      if (!cognitoUser) return reject(new Error("Not signed in"));
+      cognitoUser.getSession(async (err, session) => {
+        if (err || !session?.isValid()) {
+          showLogin();
+          return reject(new Error("Session expired"));
+        }
+        try {
+          const res = await fetch(API + path, {
+            ...options,
+            headers: {
+              "Content-Type": "application/json",
+              ...(options.headers || {}),
+              "Authorization": session.getIdToken().getJwtToken()
+            }
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.message || `Request failed (${res.status})`);
+          resolve(data);
+        } catch (e) { reject(e); }
+      });
+    });
+  }
+
+  // Extract base64 images and build attachments array
+  function extractAttachments(html) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, "text/html");
+    const imgs = doc.querySelectorAll("img");
+    const attachments = [];
+    let counter = 0;
+
+    imgs.forEach(img => {
+      const src = img.getAttribute("src");
+      if (src && src.startsWith("data:")) {
+        const match = src.match(/^data:image\/(\w+);base64,(.+)$/);
+        if (match) {
+          const cid = `img-${counter++}@workverse`;
+          attachments.push({
+            cid,
+            contentType: `image/${match[1]}`,
+            data: match[2]
+          });
+          img.setAttribute("src", `cid:${cid}`);
+        }
+      }
+    });
+
+    return {
+      html: doc.body.innerHTML,
+      attachments
+    };
+  }
+
+  $("sendBtn").addEventListener("click", async () => {
+    const list = recipients();
+    const subject = $("subject").value.trim();
+    const rawHtml = $("body").innerHTML;
+    const bodyText = $("body").textContent || "";
+    $("status").textContent = "";
+
+    if (!list.length || list.length > 100 || !subject || !bodyText.trim()) {
+      $("status").textContent = "Enter 1-100 recipients, a subject and a body.";
       return;
     }
 
-    authSession = result.AuthenticationResult;
-    saveTokens(authSession);
-    showApp();
-  } catch (error) {
-    setMessage(loginMessage, error.message);
-  }
-});
+    const { html, attachments } = extractAttachments(rawHtml);
 
-newPasswordForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  setMessage(loginMessage, "Updating password...", true);
+    if (!confirm(`Send this email to ${list.length} recipient${list.length === 1 ? "" : "s"}?`)) return;
 
-  const newPassword = document.getElementById("newPassword").value;
+    $("sendBtn").disabled = true;
+    $("status").textContent = "Sending...";
 
-  try {
-    const result = await completeNewPassword(
-      pendingChallenge.email,
-      newPassword,
-      pendingChallenge.session
-    );
-
-    authSession = result.AuthenticationResult;
-    saveTokens(authSession);
-    pendingChallenge = null;
-    newPasswordForm.classList.add("hidden");
-    loginForm.reset();
-    loginForm.classList.remove("hidden");
-    showApp();
-  } catch (error) {
-    setMessage(loginMessage, error.message);
-  }
-});
-
-document.getElementById("signOutBtn").addEventListener("click", () => {
-  clearTokens();
-  authSession = null;
-  showLogin();
-});
-
-const recipientsEl = document.getElementById("recipients");
-const recipientCountEl = document.getElementById("recipientCount");
-
-function parseRecipients(text) {
-  return [...new Set(
-    text
-      .split(/[\s,;]+/)
-      .map(x => x.trim().toLowerCase())
-      .filter(Boolean)
-  )];
-}
-
-function updateRecipientCount() {
-  const recipients = parseRecipients(recipientsEl.value);
-  recipientCountEl.textContent =
-    `${recipients.length} recipient${recipients.length === 1 ? "" : "s"}`;
-}
-
-recipientsEl.addEventListener("input", updateRecipientCount);
-
-document.getElementById("clearRecipientsBtn").addEventListener("click", () => {
-  recipientsEl.value = "";
-  document.getElementById("csvFile").value = "";
-  updateRecipientCount();
-});
-
-document.getElementById("csvFile").addEventListener("change", async (event) => {
-  const file = event.target.files[0];
-  if (!file) return;
-
-  const text = await file.text();
-
-  const emails = parseRecipients(
-    text.replace(/["']/g, " ")
-  );
-
-  recipientsEl.value = emails.join(", ");
-  updateRecipientCount();
-
-  setMessage(
-    appMessage,
-    `${emails.length} email address${emails.length === 1 ? "" : "es"} loaded.`,
-    true
-  );
-});
-
-document.getElementById("previewBtn").addEventListener("click", () => {
-  const recipients = parseRecipients(recipientsEl.value);
-  const subject = document.getElementById("subject").value.trim();
-  const body = document.getElementById("body").value;
-
-  if (!recipients.length || !subject || !body.trim()) {
-    setMessage(appMessage, "Enter recipients, subject and body first.");
-    return;
-  }
-
-  document.getElementById("previewTo").textContent =
-    recipients.length <= 3
-      ? recipients.join(", ")
-      : `${recipients.slice(0, 3).join(", ")} + ${recipients.length - 3} more`;
-
-  document.getElementById("previewSubject").textContent = subject;
-  document.getElementById("previewBody").textContent = body;
-  document.getElementById("previewModal").classList.remove("hidden");
-});
-
-document.getElementById("closePreviewBtn").addEventListener("click", () => {
-  document.getElementById("previewModal").classList.add("hidden");
-});
-
-document.getElementById("sendBtn").addEventListener("click", async () => {
-  const recipients = parseRecipients(recipientsEl.value);
-  const subject = document.getElementById("subject").value.trim();
-  const body = document.getElementById("body").value;
-
-  if (!recipients.length || !subject || !body.trim()) {
-    setMessage(appMessage, "Enter recipients, subject and body first.");
-    return;
-  }
-
-  if (recipients.length > 100) {
-    setMessage(appMessage, "Maximum 100 recipients per send.");
-    return;
-  }
-
-  const confirmed = window.confirm(
-    `Send "${subject}" to ${recipients.length} recipient${recipients.length === 1 ? "" : "s"}?`
-  );
-
-  if (!confirmed) return;
-
-  const button = document.getElementById("sendBtn");
-  button.disabled = true;
-  button.textContent = "Sending...";
-  setMessage(appMessage, "Sending...", true);
-
-  try {
-    const result = await api("/api/send", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        recipients,
-        subject,
-        body
-      })
-    });
-
-    const failed = result.failed?.length || 0;
-
-    setMessage(
-      appMessage,
-      `Completed: ${result.successful} sent${failed ? `, ${failed} failed` : ""}.`,
-      failed === 0
-    );
-
-    if (failed === 0) {
-      recipientsEl.value = "";
-      document.getElementById("subject").value = "";
-      document.getElementById("body").value = "";
-      document.getElementById("csvFile").value = "";
-      updateRecipientCount();
+    try {
+      const result = await api("/send", {
+        method: "POST",
+        body: JSON.stringify({ recipients: list, subject, body: html, attachments })
+      });
+      $("status").textContent = `Done: ${result.successful} sent, ${result.failed?.length || 0} failed.`;
+      await loadHistory();
+    } catch (e) {
+      $("status").textContent = e.message;
+    } finally {
+      $("sendBtn").disabled = false;
     }
+  });
 
-    await loadHistory();
-  } catch (error) {
-    setMessage(appMessage, error.message);
-  } finally {
-    button.disabled = false;
-    button.textContent = "Send email";
-  }
-});
-
-async function loadHistory() {
-  const history = document.getElementById("history");
-  history.innerHTML = '<div class="muted">Loading...</div>';
-
-  try {
-    const data = await api("/api/emails");
-    const items = data.items || [];
-
-    if (!items.length) {
-      history.innerHTML = '<div class="muted">No sent emails yet.</div>';
-      return;
+  async function loadHistory() {
+    $("history").innerHTML = '<div class="empty">Loading...</div>';
+    try {
+      const data = await api("/emails");
+      const items = data.items || [];
+      if (!items.length) {
+        $("history").innerHTML = '<div class="empty">No emails sent yet.</div>';
+        return;
+      }
+      $("history").innerHTML = items.map(x => `
+        <div class="history-item">
+          <div class="history-subject">${escapeHtml(x.subject || "")}
+            <span class="badge">${escapeHtml(x.status || "")}</span>
+          </div>
+          <div class="history-meta">${new Date(x.sentAt).toLocaleString()} · ${x.successful ?? 0}/${x.recipientCount ?? 0} sent</div>
+        </div>`).join("");
+    } catch (e) {
+      $("history").innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
     }
-
-    history.innerHTML = items.map(item => `
-      <div class="history-item" data-id="${escapeHtml(item.campaignId)}">
-        <div class="history-subject">${escapeHtml(item.subject)}</div>
-        <div class="history-meta">
-          ${escapeHtml(formatDate(item.sentAt))}
-          · ${Number(item.recipientCount || 0)} recipients
-          · ${escapeHtml(item.status || "")}
-        </div>
-      </div>
-    `).join("");
-
-    history.querySelectorAll(".history-item").forEach(item => {
-      item.addEventListener("click", () => loadCampaign(item.dataset.id));
-    });
-  } catch (error) {
-    history.innerHTML = `<div class="message">${escapeHtml(error.message)}</div>`;
-  }
-}
-
-async function loadCampaign(id) {
-  try {
-    const data = await api(`/api/emails/${encodeURIComponent(id)}`);
-    const campaign = data.campaign;
-    const recipients = data.recipients || [];
-
-    const lines = recipients.map(
-      r => `${r.email} — ${r.status}`
-    ).join("\n");
-
-    document.getElementById("previewTo").textContent = lines || "No recipient records";
-    document.getElementById("previewSubject").textContent = campaign.subject;
-    document.getElementById("previewBody").textContent = campaign.body;
-    document.getElementById("previewModal").classList.remove("hidden");
-  } catch (error) {
-    setMessage(appMessage, error.message);
-  }
-}
-
-document.getElementById("refreshBtn").addEventListener("click", loadHistory);
-
-function formatDate(value) {
-  try {
-    return new Date(value).toLocaleString();
-  } catch {
-    return value || "";
-  }
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-(function init() {
-  if (
-    !cfg.region ||
-    !cfg.userPoolId ||
-    !cfg.clientId ||
-    cfg.userPoolId.startsWith("REPLACE")
-  ) {
-    setMessage(
-      loginMessage,
-      "Cognito configuration is missing. Update frontend/config.js after deployment."
-    );
-    return;
   }
 
-  authSession = loadTokens();
+  $("refreshBtn").addEventListener("click", loadHistory);
 
-  if (authenticated()) {
-    showApp();
-  } else {
-    showLogin();
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
   }
+
+  getSession();
 })();
