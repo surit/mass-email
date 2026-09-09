@@ -37,6 +37,15 @@
     el.className = 'status ' + type;
   }
 
+  function resetLinkModal() {
+    const linkModal = $('linkModal');
+    const textEl = $('linkText');
+    const textLabel = $('linkTextLabel');
+    if (linkModal) linkModal.hidden = true;
+    if (textEl) textEl.hidden = false;
+    if (textLabel) textLabel.hidden = false;
+  }
+
   /* ---------- Auth ---------- */
   function getSession() {
     try {
@@ -259,19 +268,44 @@
     });
   });
 
-  /* ---------- Link modal ---------- */
+  /* ---------- Link modal (text + image) ---------- */
   const linkBtn = $('linkBtn');
   const linkModal = $('linkModal');
   let savedRange = null;
+  let isLinkingImage = false;
 
   if (linkBtn && linkModal) {
     linkBtn.addEventListener('click', () => {
       const sel = window.getSelection();
       savedRange = sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
+
+      // Detect if selection contains (or is on) an image
+      isLinkingImage = false;
+      if (savedRange) {
+        const fragment = savedRange.cloneContents();
+        if (fragment.querySelector('img')) {
+          isLinkingImage = true;
+        } else if (savedRange.collapsed) {
+          const container = savedRange.startContainer;
+          const offset = savedRange.startOffset;
+          if (container.nodeType === 1 && container.childNodes[offset]?.nodeType === 1 && container.childNodes[offset].tagName === 'IMG') {
+            isLinkingImage = true;
+            savedRange.selectNode(container.childNodes[offset]);
+          }
+        }
+      }
+
       const urlEl = $('linkUrl');
       const textEl = $('linkText');
+      const textLabel = $('linkTextLabel');
+
       if (urlEl) urlEl.value = '';
-      if (textEl) textEl.value = sel.toString() || '';
+      if (textEl) {
+        textEl.value = sel.toString() || '';
+        textEl.hidden = isLinkingImage;
+      }
+      if (textLabel) textLabel.hidden = isLinkingImage;
+
       linkModal.hidden = false;
       if (urlEl) urlEl.focus();
     });
@@ -279,8 +313,9 @@
     const cancelLink = $('cancelLink');
     if (cancelLink) {
       cancelLink.addEventListener('click', () => {
-        linkModal.hidden = true;
         savedRange = null;
+        isLinkingImage = false;
+        resetLinkModal();
       });
     }
 
@@ -288,15 +323,12 @@
     if (confirmLink) {
       confirmLink.addEventListener('click', () => {
         const url = ($('linkUrl').value || '').trim();
-        const text = ($('linkText').value || '').trim();
         if (!url) {
-          linkModal.hidden = true;
           savedRange = null;
+          isLinkingImage = false;
+          resetLinkModal();
           return;
         }
-        const safeUrl = url.replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-        const safeText = escapeHtml(text || url);
-        const html = `<a href="${safeUrl}">${safeText}</a>`;
 
         const body = $('body');
         if (body) body.focus();
@@ -310,16 +342,41 @@
           range.collapse(false);
           sel.addRange(range);
         }
-        document.execCommand('insertHTML', false, html);
-        linkModal.hidden = true;
+
+        const safeUrl = url.replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+
+        if (isLinkingImage) {
+          const range = sel.getRangeAt(0);
+          const a = document.createElement('a');
+          a.href = safeUrl;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+
+          try {
+            range.surroundContents(a);
+          } catch (e) {
+            const contents = range.extractContents();
+            a.appendChild(contents);
+            range.insertNode(a);
+          }
+        } else {
+          const text = ($('linkText').value || '').trim();
+          const safeText = escapeHtml(text || url);
+          const html = `<a href="${safeUrl}">${safeText}</a>`;
+          document.execCommand('insertHTML', false, html);
+        }
+
         savedRange = null;
+        isLinkingImage = false;
+        resetLinkModal();
       });
     }
 
     linkModal.addEventListener('click', e => {
       if (e.target === linkModal) {
-        linkModal.hidden = true;
         savedRange = null;
+        isLinkingImage = false;
+        resetLinkModal();
       }
     });
   }
@@ -469,7 +526,11 @@
   /* ---------- Global Escape key ---------- */
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
-      if (linkModal) linkModal.hidden = true;
+      if (linkModal) {
+        savedRange = null;
+        isLinkingImage = false;
+        resetLinkModal();
+      }
       if (previewModal) previewModal.hidden = true;
     }
   });
