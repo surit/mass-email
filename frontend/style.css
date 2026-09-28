@@ -286,6 +286,46 @@ button.secondary:hover {
   display: none;
 }
 
+/* Send progress */
+.send-progress {
+  margin-top: 12px;
+}
+
+.progress-track {
+  height: 6px;
+  background: #e4e6ec;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0%;
+  background: #5b4ee8;
+  transition: width 0.3s ease;
+}
+
+.progress-label {
+  font-size: 12px;
+  color: #737782;
+  margin-top: 6px;
+}
+
+/* History progress */
+.history-progress {
+  height: 4px;
+  background: #e4e6ec;
+  border-radius: 2px;
+  margin-top: 8px;
+  overflow: hidden;
+}
+
+.history-progress-bar {
+  height: 100%;
+  background: #5b4ee8;
+  transition: width 0.3s ease;
+}
+
 /* Rich-text editor */
 .editor-toolbar {
   display: flex;
@@ -367,6 +407,48 @@ button.secondary:hover {
   border-radius: 4px;
   display: block;
   margin: 8px 0;
+}
+
+/* File attachments */
+.attachment-row {
+  margin-top: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #f0f1f5;
+  border: 1px solid #d7dae2;
+  border-radius: 20px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: #454852;
+}
+
+.file-chip button {
+  background: transparent;
+  border: none;
+  color: #737782;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.file-chip button:hover {
+  color: #b42318;
 }
 
 /* Responsive */

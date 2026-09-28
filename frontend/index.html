@@ -56,7 +56,7 @@
         <label for="recipients">To</label>
         <textarea id="recipients" rows="3" placeholder="person@example.com, another@example.com"></textarea>
         <div class="row between">
-          <small class="muted">Separate emails with commas, spaces or new lines. Maximum 100 recipients.</small>
+          <small class="muted">Separate emails with commas, spaces or new lines. Upload a CSV with as many recipients as your SES account is allowed to send.</small>
           <label class="upload">
             Upload CSV
             <input id="csvFile" type="file" accept=".csv,text/csv">
@@ -88,9 +88,19 @@
         <input id="imageUpload" type="file" accept="image/*" hidden>
         <div id="body" contenteditable="true" class="editor-body" placeholder="Write your email..." tabindex="0"></div>
 
+        <div class="attachment-row">
+          <button type="button" id="fileBtn" class="secondary small">Attach Files</button>
+          <input id="fileUpload" type="file" multiple hidden>
+          <div id="fileList" class="file-list"></div>
+        </div>
+
         <div class="actions">
           <button type="button" id="previewBtn" class="secondary">Preview</button>
           <button type="button" id="sendBtn">Send Email</button>
+        </div>
+        <div id="sendProgress" class="send-progress" hidden>
+          <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+          <div id="progressLabel" class="progress-label"></div>
         </div>
         <p id="status" class="status"></p>
       </section>

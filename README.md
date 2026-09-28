@@ -1,60 +1,31 @@
-# Workverse Mail - standalone minimal email marketing app
+# Workverse Mail
 
-## AWS architecture
+A standalone email marketing application built on AWS.
 
-S3 (private) -> CloudFront (HTTPS) -> browser
-API calls -> CloudFront -> API Gateway HTTP API -> Lambda
-Lambda -> SES + dedicated DynamoDB table
-Authentication -> Cognito User Pool -> API Gateway JWT authorizer
+## Structure
 
-No Amplify, EC2, RDS, VPC, NAT Gateway or existing Workverse backend resources are required.
+- `frontend/` — Static HTML/CSS/JS files (upload to S3)
+- `infra/template.yaml` — SAM/CloudFormation template
 
-## Deploy
+## Deployment
 
-Region: ap-southeast-1
-Stack: workverse-mail
+1. Deploy the infrastructure:
+   ```bash
+   sam build && sam deploy --guided
+   ```
 
-1. Validate/build:
-   sam validate --template-file infra/template.yaml --lint
-   sam build --template-file infra/template.yaml
+2. Update `frontend/config.js` with the Cognito IDs from the stack outputs.
 
-2. Deploy:
-   sam deploy --template-file .aws-sam/build/template.yaml \
-     --stack-name workverse-mail \
-     --capabilities CAPABILITY_IAM \
-     --parameter-overrides SesFromEmail="marketing@workverse.me" \
-     --region ap-southeast-1
+3. Upload the frontend files to the S3 bucket created by the stack.
 
-3. Get outputs:
-   aws cloudformation describe-stacks --stack-name workverse-mail \
-     --region ap-southeast-1 --query 'Stacks[0].Outputs' --output table
+4. Invalidate the CloudFront distribution if needed.
 
-4. Create the first user (after deployment):
-   aws cognito-idp admin-create-user \
-     --user-pool-id <USER_POOL_ID> \
-     --username surit.aryal@workverse.me \
-     --user-attributes Name=email,Value=surit.aryal@workverse.me Name=email_verified,Value=true \
-     --temporary-password '<TEMPORARY_PASSWORD>' \
-     --region ap-southeast-1
+## Features
 
-Use a strong temporary password. Cognito will require the user to set a new password at first sign-in.
-
-5. Configure frontend/config.js:
-   userPoolId: output UserPoolId
-   clientId: output UserPoolClientId
-
-6. Upload:
-   aws s3 sync frontend/ s3://<FRONTEND_BUCKET>/ --delete --region ap-southeast-1
-
-7. Open the CloudFrontUrl.
-
-## SES sandbox
-
-Until SES production access is approved, recipients must be verified in SES. The verified sender is marketing@workverse.me because the domain is verified.
-
-## Notes
-
-- Initial send limit is 100 recipients per request.
-- Send history is stored in DynamoDB.
-- Preview is local and does not send.
-- CSV upload extracts email addresses from the file in the browser.
+- Bulk email campaigns (unlimited recipients via chunked uploads)
+- Rich-text HTML editor with inline images
+- File attachments (PDF, CSV, TXT, etc.)
+- Hyperlinks on text and images
+- CSV contact import
+- Campaign progress tracking
+- Cognito authentication

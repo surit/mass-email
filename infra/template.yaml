@@ -114,14 +114,38 @@ Resources:
       FunctionName: workverse-mail-function
       Runtime: python3.12
       Handler: index.handler
-      Timeout: 60
-      MemorySize: 256
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref MailTable
+          SES_FROM_EMAIL: !Ref SesFromEmail
+          MAIL_BUCKET: !Ref MailBucket
+          CAMPAIGN_PREFIX: campaigns/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MailTable
+        - S3CrudPolicy:
+            BucketName: !Ref MailBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+                - ses:GetSendQuota
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:workverse-mail-function"
       InlineCode: |
         import base64
         import decimal
+        import hashlib
         import json
         import os
         import re
+        import time
         import uuid
         from datetime import datetime, timezone
         from email.mime.multipart import MIMEMultipart
@@ -135,9 +159,14 @@ Resources:
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(os.environ["TABLE_NAME"])
         ses = boto3.client("ses")
+        s3 = boto3.client("s3")
+        lambda_client = boto3.client("lambda")
         FROM_EMAIL = os.environ["SES_FROM_EMAIL"]
+        MAIL_BUCKET = os.environ["MAIL_BUCKET"]
+        CAMPAIGN_PREFIX = os.environ.get("CAMPAIGN_PREFIX", "campaigns/")
 
         EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+        WORKER_BATCH_SIZE = 10
 
         class DecimalEncoder(json.JSONEncoder):
             def default(self, obj):
@@ -158,31 +187,112 @@ Resources:
                 body = base64.b64decode(body).decode("utf-8")
             return json.loads(body)
 
-        def handler(event, context):
-            request_context = event.get("requestContext", {})
-            http = request_context.get("http", {})
-            method = http.get("method", "")
-            path = event.get("rawPath", "")
+        def now():
+            return datetime.now(timezone.utc).isoformat()
 
-            if method == "POST" and path.endswith("/api/send"):
-                return send_email(event)
-            if method == "GET" and path.endswith("/api/emails"):
-                return list_campaigns()
-            match = re.search(r"/api/emails/([^/]+)$", path)
-            if method == "GET" and match:
-                return get_campaign(match.group(1))
-            return response(404, {"message": "Not found"})
+        def recipient_key(email):
+            digest = hashlib.sha256(email.encode("utf-8")).hexdigest()
+            return "RECIPIENT#" + digest
 
-        def send_email(event):
+        def campaign_key(campaign_id):
+            return "CAMPAIGN#" + campaign_id
+
+        def load_payload(campaign_id):
+            obj = s3.get_object(Bucket=MAIL_BUCKET, Key=f"{CAMPAIGN_PREFIX}{campaign_id}/payload.json")
+            return json.loads(obj["Body"].read().decode("utf-8"))
+
+        def store_payload(campaign_id, payload):
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            s3.put_object(
+                Bucket=MAIL_BUCKET,
+                Key=f"{CAMPAIGN_PREFIX}{campaign_id}/payload.json",
+                Body=data,
+                ContentType="application/json",
+                ServerSideEncryption="AES256"
+            )
+
+        def update_campaign_summary(campaign_id, status=None, **values):
+            meta = table.get_item(Key={"pk": campaign_key(campaign_id), "sk": "META"}).get("Item")
+            if not meta:
+                return
+            updates = []
+            names = {}
+            expr_values = {}
+            for field, value in values.items():
+                safe = "#" + field
+                updates.append(f"{safe} = :{field}")
+                names[safe] = field
+                expr_values[":" + field] = value
+            if status is not None:
+                updates.append("#status = :status")
+                names["#status"] = "status"
+                expr_values[":status"] = status
+            if not updates:
+                return
+            table.update_item(
+                Key={"pk": campaign_key(campaign_id), "sk": "META"},
+                UpdateExpression="SET " + ", ".join(updates),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=expr_values
+            )
+            sent_at = meta.get("sentAt", "")
+            if sent_at:
+                table.update_item(
+                    Key={"pk": "CAMPAIGNS", "sk": sent_at + "#" + campaign_id},
+                    UpdateExpression="SET " + ", ".join(updates),
+                    ExpressionAttributeNames=names,
+                    ExpressionAttributeValues=expr_values
+                )
+
+        def create_campaign(event):
             try:
                 data = parse_body(event)
-                raw_recipients = data.get("recipients", [])
-                if not isinstance(raw_recipients, list):
+                subject = str(data.get("subject", "")).strip()
+                body_html = str(data.get("body", ""))
+                attachments = data.get("attachments", [])
+                if not subject:
+                    return response(400, {"message": "Subject is required."})
+                if not body_html.strip():
+                    return response(400, {"message": "Email body is required."})
+                if not isinstance(attachments, list):
+                    attachments = []
+
+                campaign_id = str(uuid.uuid4())
+                sent_at = now()
+                campaign = {
+                    "campaignId": campaign_id,
+                    "subject": subject,
+                    "body": body_html,
+                    "recipientCount": 0,
+                    "successful": 0,
+                    "failed": 0,
+                    "invalid": 0,
+                    "sentAt": sent_at,
+                    "status": "QUEUED"
+                }
+                store_payload(campaign_id, {"subject": subject, "body": body_html, "attachments": attachments})
+                table.put_item(Item={"pk": "CAMPAIGNS", "sk": sent_at + "#" + campaign_id, **campaign})
+                table.put_item(Item={"pk": campaign_key(campaign_id), "sk": "META", **campaign})
+                return response(201, campaign)
+            except Exception as error:
+                return response(500, {"message": str(error)})
+
+        def add_recipients(campaign_id, event):
+            try:
+                meta = table.get_item(Key={"pk": campaign_key(campaign_id), "sk": "META"}).get("Item")
+                if not meta:
+                    return response(404, {"message": "Campaign not found"})
+                if meta.get("status") not in ("QUEUED",):
+                    return response(409, {"message": "Recipients can only be added before the campaign starts."})
+
+                data = parse_body(event)
+                raw = data.get("recipients", [])
+                if not isinstance(raw, list):
                     return response(400, {"message": "Recipients must be a list."})
 
                 recipients = []
                 invalid = []
-                for value in raw_recipients:
+                for value in raw:
                     email = ""
                     name = ""
                     if isinstance(value, dict):
@@ -193,148 +303,241 @@ Resources:
                         name = ""
                     else:
                         continue
-
                     if EMAIL_RE.fullmatch(email):
                         recipients.append({"email": email, "name": name})
                     elif email:
                         invalid.append(email)
 
-                # Deduplicate by email
-                seen = set()
-                deduped = []
-                for r in recipients:
-                    if r["email"] not in seen:
-                        seen.add(r["email"])
-                        deduped.append(r)
-                recipients = deduped
-
-                subject = str(data.get("subject", "")).strip()
-                body_html = str(data.get("body", ""))
-
-                if not recipients:
-                    return response(400, {"message": "At least one valid recipient is required."})
-                if len(recipients) > 100:
-                    return response(400, {"message": "Maximum 100 recipients per send."})
-                if not subject:
-                    return response(400, {"message": "Subject is required."})
-                if not body_html.strip():
-                    return response(400, {"message": "Email body is required."})
-
-                campaign_id = str(uuid.uuid4())
-                sent_at = datetime.now(timezone.utc).isoformat()
-                successful = 0
-                failed = []
-
-                attachments = data.get("attachments", [])
-
-                for recipient in recipients:
-                    email = recipient["email"]
-                    name = recipient["name"]
-
-                    # Personalize body
-                    personalized_html = body_html.replace("{{Name}}", name).replace("{{Email}}", email)
-                    personalized_plain = re.sub(r"<[^>]+>", "", personalized_html)
-
-                    msg = MIMEMultipart("related")
-                    msg["Subject"] = subject
-                    msg["From"] = FROM_EMAIL
-                    msg["To"] = email
-
-                    msg_alt = MIMEMultipart("alternative")
-                    msg.attach(msg_alt)
-
-                    msg_alt.attach(MIMEText(personalized_plain, "plain", "utf-8"))
-                    msg_alt.attach(MIMEText(personalized_html, "html", "utf-8"))
-
-                    for att in attachments:
-                        cid = att.get("cid", "")
-                        att_data = att.get("data", "")
-                        content_type = att.get("contentType", "image/jpeg")
-                        if not cid or not att_data:
-                            continue
-                        main_type, sub_type = content_type.split("/", 1) if "/" in content_type else ("image", "jpeg")
-                        mime_base = MIMEBase(main_type, sub_type)
-                        mime_base.set_payload(base64.b64decode(att_data))
-                        encoders.encode_base64(mime_base)
-                        mime_base.add_header("Content-ID", f"<{cid}>")
-                        mime_base.add_header("Content-Disposition", "inline", filename=cid)
-                        msg.attach(mime_base)
-
-                    raw_message = {"Data": msg.as_string()}
-
-                    try:
-                        result = ses.send_raw_email(Source=FROM_EMAIL, Destinations=[email], RawMessage=raw_message)
-                        table.put_item(Item={
-                            "pk": "CAMPAIGN#" + campaign_id,
-                            "sk": "RECIPIENT#" + email,
-                            "campaignId": campaign_id,
-                            "email": email,
-                            "subject": subject,
-                            "sentAt": sent_at,
-                            "status": "SENT",
-                            "messageId": result.get("MessageId", "")
+                added = 0
+                with table.batch_writer() as batch:
+                    for r in recipients:
+                        batch.put_item(Item={
+                            "pk": campaign_key(campaign_id),
+                            "sk": recipient_key(r["email"]),
+                            "email": r["email"],
+                            "name": r["name"],
+                            "status": "PENDING"
                         })
-                        successful += 1
-                    except ClientError as error:
-                        error_message = error.response.get("Error", {}).get("Message", "SES error")
-                        failed.append({"email": email, "message": error_message})
+                        added += 1
 
-                status = "SENT" if len(failed) == 0 else "FAILED" if successful == 0 else "PARTIAL"
-
-                campaign = {
-                    "campaignId": campaign_id,
-                    "subject": subject,
-                    "body": body_html,
-                    "recipientCount": len(recipients),
-                    "successful": successful,
-                    "failed": len(failed),
-                    "invalid": len(invalid),
-                    "sentAt": sent_at,
-                    "status": status
-                }
-
-                table.put_item(Item={"pk": "CAMPAIGNS", "sk": sent_at + "#" + campaign_id, **campaign})
-                table.put_item(Item={"pk": "CAMPAIGN#" + campaign_id, "sk": "META", **campaign})
-
-                return response(200, {**campaign, "failedRecipients": failed, "invalidRecipients": invalid})
-
+                current = meta.get("recipientCount", 0)
+                new_total = current + added
+                update_campaign_summary(campaign_id, recipientCount=new_total, invalid=meta.get("invalid", 0) + len(invalid))
+                return response(200, {"campaignId": campaign_id, "added": added, "invalid": len(invalid), "recipientCount": new_total})
             except Exception as error:
                 return response(500, {"message": str(error)})
+
+        def start_campaign(campaign_id):
+            try:
+                meta = table.get_item(Key={"pk": campaign_key(campaign_id), "sk": "META"}).get("Item")
+                if not meta:
+                    return response(404, {"message": "Campaign not found"})
+                if meta.get("status") != "QUEUED":
+                    return response(409, {"message": "Campaign already started or finished."})
+                if meta.get("recipientCount", 0) == 0:
+                    return response(400, {"message": "No recipients added."})
+
+                update_campaign_summary(campaign_id, status="SENDING", startedAt=now())
+                lambda_client.invoke(
+                    FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"],
+                    InvocationType="Event",
+                    Payload=json.dumps({"action": "process_campaign", "campaignId": campaign_id})
+                )
+                return response(200, {"campaignId": campaign_id, "status": "SENDING"})
+            except Exception as error:
+                return response(500, {"message": str(error)})
+
+        def build_message(email, name, payload):
+            subject = payload["subject"]
+            body_html = payload["body"]
+            attachments = payload.get("attachments", [])
+            personalized_html = body_html.replace("{{Name}}", name).replace("{{Email}}", email)
+            personalized_plain = re.sub(r"<[^>]+>", "", personalized_html)
+
+            # Root must be mixed so clients recognise regular file attachments
+            msg = MIMEMultipart("mixed")
+            msg["Subject"] = subject
+            msg["From"] = FROM_EMAIL
+            msg["To"] = email
+
+            # Related container holds the HTML body and inline images
+            msg_related = MIMEMultipart("related")
+            msg.attach(msg_related)
+
+            msg_alt = MIMEMultipart("alternative")
+            msg_related.attach(msg_alt)
+
+            msg_alt.attach(MIMEText(personalized_plain, "plain", "utf-8"))
+            msg_alt.attach(MIMEText(personalized_html, "html", "utf-8"))
+
+            for att in attachments:
+                cid = att.get("cid", "")
+                filename = att.get("filename", "")
+                att_data = att.get("data", "")
+                content_type = att.get("contentType", "application/octet-stream")
+                if not att_data:
+                    continue
+                main_type, sub_type = content_type.split("/", 1) if "/" in content_type else ("application", "octet-stream")
+                mime_base = MIMEBase(main_type, sub_type)
+                mime_base.set_payload(base64.b64decode(att_data))
+                encoders.encode_base64(mime_base)
+
+                if cid:
+                    # Inline image – belongs inside the related part
+                    mime_base.add_header("Content-ID", f"<{cid}>")
+                    mime_base.add_header("Content-Disposition", "inline", filename=cid)
+                    msg_related.attach(mime_base)
+                elif filename:
+                    # Regular file attachment – belongs at the mixed root
+                    mime_base.add_header("Content-Disposition", "attachment", filename=filename)
+                    msg.attach(mime_base)
+
+            return {"Data": msg.as_string()}
+
+        def send_one(recipient, payload, rate):
+            email = recipient["email"]
+            name = recipient.get("name", "")
+            raw_message = build_message(email, name, payload)
+            delay = 0.0
+            for attempt in range(4):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    result = ses.send_raw_email(Source=FROM_EMAIL, Destinations=[email], RawMessage=raw_message)
+                    return True, result.get("MessageId", ""), ""
+                except ClientError as error:
+                    code = error.response.get("Error", {}).get("Code", "")
+                    message = error.response.get("Error", {}).get("Message", "SES error")
+                    if code in ("Throttling", "ThrottlingException", "TooManyRequestsException") and attempt < 3:
+                        delay = max(1.0 / max(rate, 0.1), 1.0) * (2 ** attempt)
+                        continue
+                    return False, "", message
+            return False, "", "SES send failed"
+
+        def process_campaign(campaign_id, last_key=None):
+            campaign_result = table.get_item(Key={"pk": campaign_key(campaign_id), "sk": "META"})
+            campaign = campaign_result.get("Item")
+            if not campaign or campaign.get("status") not in ("SENDING", "QUEUED"):
+                return
+
+            if campaign.get("status") == "QUEUED":
+                update_campaign_summary(campaign_id, status="SENDING", startedAt=now())
+
+            payload = load_payload(campaign_id)
+            try:
+                quota = ses.get_send_quota()
+                rate = float(quota.get("MaxSendRate", 1.0) or 1.0)
+            except Exception:
+                rate = 1.0
+
+            query = {
+                "KeyConditionExpression": "pk = :pk",
+                "ExpressionAttributeValues": {":pk": campaign_key(campaign_id)},
+                "Limit": WORKER_BATCH_SIZE
+            }
+            if last_key:
+                query["ExclusiveStartKey"] = last_key
+
+            result = table.query(**query)
+            items = result.get("Items", [])
+            next_key = result.get("LastEvaluatedKey")
+
+            successful = 0
+            failed = 0
+            for item in items:
+                if item.get("sk") == "META" or item.get("status") != "PENDING":
+                    continue
+                ok, message_id, error_msg = send_one({"email": item["email"], "name": item.get("name", "")}, payload, rate)
+                if ok:
+                    table.update_item(
+                        Key={"pk": item["pk"], "sk": item["sk"]},
+                        UpdateExpression="SET #status = :status, messageId = :mid, sentAt = :sent",
+                        ExpressionAttributeNames={"#status": "status"},
+                        ExpressionAttributeValues={":status": "SENT", ":mid": message_id, ":sent": now()}
+                    )
+                    successful += 1
+                else:
+                    table.update_item(
+                        Key={"pk": item["pk"], "sk": item["sk"]},
+                        UpdateExpression="SET #status = :status, errorMessage = :err, sentAt = :sent",
+                        ExpressionAttributeNames={"#status": "status"},
+                        ExpressionAttributeValues={":status": "FAILED", ":err": error_msg, ":sent": now()}
+                    )
+                    failed += 1
+
+            meta = table.get_item(Key={"pk": campaign_key(campaign_id), "sk": "META"}).get("Item", {})
+            new_successful = meta.get("successful", 0) + successful
+            new_failed = meta.get("failed", 0) + failed
+            total = meta.get("recipientCount", 0)
+
+            if next_key and new_successful + new_failed < total:
+                update_campaign_summary(campaign_id, successful=new_successful, failed=new_failed)
+                lambda_client.invoke(
+                    FunctionName=os.environ["AWS_LAMBDA_FUNCTION_NAME"],
+                    InvocationType="Event",
+                    Payload=json.dumps({"action": "process_campaign", "campaignId": campaign_id, "lastKey": next_key})
+                )
+            else:
+                status = "SENT" if new_failed == 0 else "FAILED" if new_successful == 0 else "PARTIAL"
+                update_campaign_summary(campaign_id, status=status, successful=new_successful, failed=new_failed, finishedAt=now())
 
         def list_campaigns():
             result = table.query(KeyConditionExpression="pk = :pk", ExpressionAttributeValues={":pk": "CAMPAIGNS"}, ScanIndexForward=False, Limit=20)
             return response(200, {"items": result.get("Items", [])})
 
         def get_campaign(campaign_id):
-            campaign_result = table.get_item(Key={"pk": "CAMPAIGN#" + campaign_id, "sk": "META"})
+            campaign_result = table.get_item(Key={"pk": campaign_key(campaign_id), "sk": "META"})
             campaign = campaign_result.get("Item")
             if not campaign:
                 return response(404, {"message": "Campaign not found"})
-            recipients_result = table.query(KeyConditionExpression="pk = :pk", ExpressionAttributeValues={":pk": "CAMPAIGN#" + campaign_id})
+            recipients_result = table.query(KeyConditionExpression="pk = :pk", ExpressionAttributeValues={":pk": campaign_key(campaign_id)})
             recipients = [item for item in recipients_result.get("Items", []) if item.get("sk", "") != "META"]
             return response(200, {"campaign": campaign, "recipients": recipients})
 
-      Environment:
-        Variables:
-          TABLE_NAME: !Ref MailTable
-          SES_FROM_EMAIL: !Ref SesFromEmail
+        def handler(event, context):
+            request_context = event.get("requestContext", {})
+            http = request_context.get("http", {})
+            method = http.get("method", "")
+            path = event.get("rawPath", "")
 
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref MailTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - ses:SendEmail
-                - ses:SendRawEmail
-              Resource: "*"
+            # Internal async worker invocation
+            if event.get("action") == "process_campaign":
+                process_campaign(event.get("campaignId"), event.get("lastKey"))
+                return {"statusCode": 200, "body": "ok"}
+
+            if method == "POST" and path.endswith("/api/campaigns"):
+                return create_campaign(event)
+            match = re.search(r"/api/campaigns/([^/]+)/recipients$", path)
+            if method == "POST" and match:
+                return add_recipients(match.group(1), event)
+            match = re.search(r"/api/campaigns/([^/]+)/start$", path)
+            if method == "POST" and match:
+                return start_campaign(match.group(1))
+            if method == "GET" and path.endswith("/api/emails"):
+                return list_campaigns()
+            match = re.search(r"/api/emails/([^/]+)$", path)
+            if method == "GET" and match:
+                return get_campaign(match.group(1))
+            return response(404, {"message": "Not found"})
 
       Events:
         SendEmail:
           Type: HttpApi
           Properties:
             ApiId: !Ref MailApi
-            Path: /api/send
+            Path: /api/campaigns
+            Method: POST
+        AddRecipients:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MailApi
+            Path: /api/campaigns/{campaignId}/recipients
+            Method: POST
+        StartCampaign:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MailApi
+            Path: /api/campaigns/{campaignId}/start
             Method: POST
         ListEmails:
           Type: HttpApi
